@@ -1,0 +1,397 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Xc的博客</title>
+  
+  
+  <link href="/atom.xml" rel="self"/>
+  
+  <link href="https://billxc.github.io/"/>
+  <updated>2022-09-12T04:18:03.613Z</updated>
+  <id>https://billxc.github.io/</id>
+  
+  <author>
+    <name>Xiaochen Wu</name>
+    
+  </author>
+  
+  <generator uri="http://hexo.io/">Hexo</generator>
+  
+  <entry>
+    <title>搭建Chrome的clangd indexer server</title>
+    <link href="https://billxc.github.io/2022/09/09/cpp/clangd-index/"/>
+    <id>https://billxc.github.io/2022/09/09/cpp/clangd-index/</id>
+    <published>2022-09-09T14:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<h3 id="前言"><a href="#前言" class="headerlink" title="前言"></a>前言</h3><p>最近的新工作是第一次在Mac上对进行Chrome的二次开发。作为一个VSCode爱好者，必须在VSCode上搭建一个用着顺手的开发环境。</p><p>Chrome使用了GN/Ninja作为构建系统，llvm/clang作为编译器。由于编辑过程比较复杂，自带的C/C++插件无法做到开箱即用，恰好llvm项目有一个clangd的子项目，提供语法分析的服务，而clangd恰好有VSCode的插件，而Chrome也很贴心地提供了clangd所需的<code>compile_commands.json</code>的<a href="https://Chrome.googlesource.com/Chrome/src/+/master/docs/clangd.md" target="_blank" rel="noopener">生成脚本</a>。</p><p>这个方案看起来很美好，但是在实际使用中，发现了一些问题：</p><ol><li>clangd有了<code>compile_commands.json</code>之后，除了会解析当前正在编辑的文件及其依赖，还会自动去解析项目中所有的文件，这个过程会非常耗时（大约七八个小时），这个过程还会占用大量的CPU资源，导致电脑风扇狂转，让本就散热捉急的MBP2019变得更加烫手。</li><li>分析完所有文件后，如果代码有大批量的更改，比如切换分支，对main分支进行rebase等等，clangd会自动重新分析，main分支一天的commit的代码更改，便会导致clangd对几乎所有的文件进行重新分析。</li></ol><p>针对这个问题，clangd是有一个解决方案的，那就是clangd indexer server。只需要在本地生成一次clangd index文件，然后使用clangd index server加载，就组成了一台可以供多个客户端使用的clangd indexer server。这样就可以避免每次都要重新生成clangd index文件，而且可以在多个客户端共享。</p><p>虽然Chrome很复杂，但是Chrome也是可以搭建clangd index server的，Chrome官方就有也有自己的<a href="https://github.com/clangd/Chrome-remote-index/blob/main/docs/index.md" target="_blank" rel="noopener">clangd index server</a>。作为Chrome的二次开发者，我们是不能直接用Chrome的index server的，所以我们需要搭建自己的clangd index server。</p><h3 id="一些挑战"><a href="#一些挑战" class="headerlink" title="一些挑战"></a>一些挑战</h3><ol><li>Chrome使用的llvm版本并不是release版本，而是Chrome自己内部编译的版本，而我们的Chrome也使用了我们自己内部定制编译的llvm，而这个定制版本的llvm是不包含clangd的，所以我们需要自己编译clangd。</li><li>Chrome官方的clangd index server是针对Linux的，搜索了网上的内容，Mac版本的Chrome remote index并没有人分享过相关内容，需要自己蹚水。</li></ol><h3 id="准备工作"><a href="#准备工作" class="headerlink" title="准备工作"></a>准备工作</h3><ol><li>确保本地已经安装好了Chrome的编译环境，即已经编译过一次Chrome</li><li>安装cmake，git，ninja，brew</li></ol><h3 id="搭建步骤"><a href="#搭建步骤" class="headerlink" title="搭建步骤"></a>搭建步骤</h3><h4 id="确定clangd的版本和gRPC的版本，并且下载其源码"><a href="#确定clangd的版本和gRPC的版本，并且下载其源码" class="headerlink" title="确定clangd的版本和gRPC的版本，并且下载其源码"></a>确定clangd的版本和gRPC的版本，并且下载其源码</h4><ol><li>在src目录下执行 <code>gclient sync</code></li><li><p>在shell中运行<code>third_party/llvm-build/Release+Asserts/bin/clang --version</code> 你会得到类似于以下的信息</p><pre><code>clang version 15.0.0 (https://github.com/llvm/llvm-project.git 4ba6a9c9f65bbc8bd06e3652cb20fd4dfc846137)Target: x86_64-apple-darwin21.6.0Thread model: posixInstalledDir: /Users/xc/repos/llvm-project/build/bin</code></pre><p> 其中的<code>4ba6a9c</code>就是llvm的commit version</p></li><li>下载llvm源码，执行 <code>git clone https://github.com/llvm/llvm-project</code></li><li>切换到llvm的commit version，执行<code>git checkout 4ba6a9c</code>（将4ba6a9c替换为你自己的commit version）</li><li>在llvm的<a href="https://github.com/llvm/llvm-project/tree/main/clang-tools-extra/clangd/index/remote/README.md" target="_blank" rel="noopener">clang-tools-extra/clangd/index/remote/README.md</a>文件中，写有grpc的版本号，以及代码的下载方式（本文以v1.36.3为例）</li><li>下载grpc源码，执行 <code>git clone -b v1.36.3 https://github.com/grpc/grpc</code></li></ol><h4 id="编译gRPC（作为clangd的依赖项）"><a href="#编译gRPC（作为clangd的依赖项）" class="headerlink" title="编译gRPC（作为clangd的依赖项）"></a>编译gRPC（作为clangd的依赖项）</h4><p>在上一步中的README.md中，有编译gRPC的步骤，如果已经按照步骤编译过gRPC，可以跳过这一步。PS:以下命令都是在grpc的根目录下执行<br><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment"># 使用brew安装编译gRPC所需的依赖</span></span><br><span class="line">brew install autoconf automake libtool shtool</span><br><span class="line"></span><br><span class="line"><span class="comment"># 加载git submodule中的内容</span></span><br><span class="line">git submodule update --init</span><br><span class="line"></span><br><span class="line">mkdir build</span><br><span class="line"></span><br><span class="line"><span class="comment"># 下一步中我们会用GRPC_INSTALL_PATH来指定gRPC的安装路径，这里我们指定为~/.grpc_install</span></span><br><span class="line"><span class="built_in">export</span> GRPC_INSTALL_PATH=<span class="variable">$HOME</span>/.grpc_install</span><br><span class="line"></span><br><span class="line">cmake -S . -B build \</span><br><span class="line">-DCMAKE_BUILD_TYPE=Release \ <span class="comment"># Release模式</span></span><br><span class="line">-DgRPC_INSTALL=ON \</span><br><span class="line">-DgRPC_BUILD_TESTS=OFF \</span><br><span class="line">-DCMAKE_INSTALL_PREFIX=<span class="variable">$GRPC_INSTALL_PATH</span> \</span><br><span class="line">-G Ninja</span><br><span class="line"><span class="comment"># CMAKE_BUILD_TYPE=Release选项开启Release模式，gRPC的性能会更好</span></span><br><span class="line"><span class="comment"># gRPC_INSTALL=ON选项可以在编译后对gRPC进行安装，</span></span><br><span class="line"><span class="comment"># gRPC_BUILD_TESTS=OFF选项可以避免编译gRPC的测试用例</span></span><br><span class="line"><span class="comment"># CMAKE_INSTALL_PREFIX=$GRPC_INSTALL_PATH 选项指定gRPC的安装路径</span></span><br><span class="line"><span class="comment"># -G Ninja选项可以使用ninja来编译gRPC</span></span><br><span class="line"></span><br><span class="line"><span class="comment"># 编译gRPC，并且安装到~/.grpc_install目录下</span></span><br><span class="line">cmake --build build --target install</span><br></pre></td></tr></table></figure></p><h4 id="编译clangd"><a href="#编译clangd" class="headerlink" title="编译clangd"></a>编译clangd</h4><p>使用shell进入llvm的根目录，执行以下命令<br><figure class="highlight bash"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br></pre></td><td class="code"><pre><span class="line">makedir build</span><br><span class="line"></span><br><span class="line"><span class="comment"># 使用上一步中的GRPC_INSTALL_PATH来指定gRPC的安装路径</span></span><br><span class="line"><span class="built_in">export</span> GRPC_INSTALL_PATH=<span class="variable">$HOME</span>/.grpc_install</span><br><span class="line"></span><br><span class="line">cmake -S llvm -B build \</span><br><span class="line">-DCMAKE_BUILD_TYPE=Release \</span><br><span class="line">-DLLVM_ENABLE_PROJECTS=<span class="string">"clang;clang-tools-extra"</span> \</span><br><span class="line">-DCLANGD_ENABLE_REMOTE=On \</span><br><span class="line">-DCMAKE_INSTALL_PREFIX=<span class="variable">$GRPC_INSTALL_PATH</span> \</span><br><span class="line">-DGRPC_INSTALL_PATH=<span class="variable">$GRPC_INSTALL_PATH</span> \</span><br><span class="line">-G Ninja</span><br><span class="line"><span class="comment"># -DLLVM_ENABLE_PROJECTS="clang;clang-tools-extra" llvm默认只编译clang，这里我们需要编译clangd，所以需要加上clang-tools-extra</span></span><br><span class="line"><span class="comment"># -DCLANGD_ENABLE_REMOTE=On 开启clangd的remote模式（默认是关闭的）</span></span><br><span class="line"><span class="comment"># -DCMAKE_INSTALL_PREFIX=$GRPC_INSTALL_PATH 指定gRPC的安装路径</span></span><br><span class="line"></span><br><span class="line">cmake --build build</span><br></pre></td></tr></table></figure></p><h4 id="生成compile-commands-json"><a href="#生成compile-commands-json" class="headerlink" title="生成compile_commands.json"></a>生成compile_commands.json</h4><h4 id="生成ninja-build的中间文件"><a href="#生成ninja-build的中间文件" class="headerlink" title="生成ninja build的中间文件"></a>生成ninja build的中间文件</h4><h4 id="生成clangd的remote-index"><a href="#生成clangd的remote-index" class="headerlink" title="生成clangd的remote index"></a>生成clangd的remote index</h4><h3 id="TODO-未完待续…"><a href="#TODO-未完待续…" class="headerlink" title="TODO:未完待续…"></a>TODO:未完待续…</h3><h3 id="中间遇到的坑"><a href="#中间遇到的坑" class="headerlink" title="中间遇到的坑"></a>中间遇到的坑</h3><ol><li><p>版本不匹配<br> clangd和gRPC的版本不匹配，会导致编译失败。<br> 我因为这个原因，编译了好几次，最终才摸索出找到正确的匹配的版本号的方法</p></li><li><p>中间文件缺失</p></li></ol><h3 id="后记"><a href="#后记" class="headerlink" title="后记"></a>后记</h3><p>…</p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;h3 id=&quot;前言&quot;&gt;&lt;a href=&quot;#前言&quot; class=&quot;headerlink&quot; title=&quot;前言&quot;&gt;&lt;/a&gt;前言&lt;/h3&gt;&lt;p&gt;最近的新工作是第一次在Mac上对进行Chrome的二次开发。作为一个VSCode爱好者，必须在VSCode上搭建一个用着顺手的开发环境。&lt;/
+      
+    
+    </summary>
+    
+    
+      <category term="Chrome" scheme="https://billxc.github.io/tags/Chrome/"/>
+    
+      <category term="clang" scheme="https://billxc.github.io/tags/clang/"/>
+    
+      <category term="clangd" scheme="https://billxc.github.io/tags/clangd/"/>
+    
+      <category term="llvm" scheme="https://billxc.github.io/tags/llvm/"/>
+    
+      <category term="cpp" scheme="https://billxc.github.io/tags/cpp/"/>
+    
+      <category term="cmake" scheme="https://billxc.github.io/tags/cmake/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>为SpringBoot的启动过程埋点</title>
+    <link href="https://billxc.github.io/2018/12/10/spring%E6%9D%82%E8%AE%B0/%E4%B8%BASpringBoot%E7%9A%84%E5%90%AF%E5%8A%A8%E8%BF%87%E7%A8%8B%E5%9F%8B%E7%82%B9/"/>
+    <id>https://billxc.github.io/2018/12/10/spring杂记/为SpringBoot的启动过程埋点/</id>
+    <published>2018-12-10T10:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.617Z</updated>
+    
+    <content type="html"><![CDATA[<p>简而言之，继承<code>org.springframework.boot.SpringApplicationRunListener</code>，并且让Spring加载进来。</p><h2 id="为什么要为SpringBoot的启动过程埋点"><a href="#为什么要为SpringBoot的启动过程埋点" class="headerlink" title="为什么要为SpringBoot的启动过程埋点"></a>为什么要为SpringBoot的启动过程埋点</h2><p>因为SpringBoot启动过慢，需要找出在Spring的哪一步遇到了性能问题，然后进行专项优化。</p><h2 id="为什么不能用Spring的EventListener来处理"><a href="#为什么不能用Spring的EventListener来处理" class="headerlink" title="为什么不能用Spring的EventListener来处理"></a>为什么不能用Spring的EventListener来处理</h2><p>EventListener的一种用法如下：<br><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br></pre></td><td class="code"><pre><span class="line"><span class="meta">@EventListener</span></span><br><span class="line"><span class="function"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title">handleEventObject</span><span class="params">(Object event)</span> </span>&#123;</span><br><span class="line">    System.out.println(<span class="string">"event: "</span>+event.getClass());</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure></p><p>如果可以用，那EventHandler是侵入性很低，工作量又小的一种方式，但是EventListener只有在Spring容器初始化完毕后才会收到消息，无法胜任监听</p><h2 id="SpringApplicationRunListeners-VS-SpringApplicationRunListener"><a href="#SpringApplicationRunListeners-VS-SpringApplicationRunListener" class="headerlink" title="SpringApplicationRunListeners VS SpringApplicationRunListener"></a>SpringApplicationRunListeners VS SpringApplicationRunListener</h2><p><code>SpringApplicationRunListener</code>是Spring内部的一个接口，方法有（入参和出参省略）：</p><ul><li><p><code>starting()</code></p></li><li><p><code>environmentPrepared()</code></p></li><li><p><code>contextPrepared()</code></p></li><li><p><code>contextLoaded()</code></p></li><li><p><code>void started()</code></p></li><li><p><code>void running()</code></p></li><li><p><code>void failed()</code></p></li></ul><p>简单看一眼这些方法名就知道，这些都像是在Spring容器初始化的过程会调用到的回调函数，如果我们可以自己定义SpringApplicationRunListener并让Spring加载，就可以做到为SpringBoot的启动埋点。但翻遍文档后发现，Spring并未为开发者提供SpringApplicationRunListener的配置入口，于是便看了看SpringBoot的部分源码。</p><h2 id="Spring-何时加载-SpringApplicationRunListener"><a href="#Spring-何时加载-SpringApplicationRunListener" class="headerlink" title="Spring 何时加载 SpringApplicationRunListener"></a>Spring 何时加载 SpringApplicationRunListener</h2><p>关键代码 <code>new SpringApplication(primarySources).run(args);</code>:</p><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br><span class="line">34</span><br><span class="line">35</span><br><span class="line">36</span><br><span class="line">37</span><br><span class="line">38</span><br><span class="line">39</span><br><span class="line">40</span><br><span class="line">41</span><br><span class="line">42</span><br><span class="line">43</span><br><span class="line">44</span><br><span class="line">45</span><br><span class="line">46</span><br><span class="line">47</span><br><span class="line">48</span><br><span class="line">49</span><br><span class="line">50</span><br><span class="line">51</span><br><span class="line">52</span><br><span class="line">53</span><br><span class="line">54</span><br></pre></td><td class="code"><pre><span class="line"><span class="comment">/**</span></span><br><span class="line"><span class="comment"> * Run the Spring application, creating and refreshing a new</span></span><br><span class="line"><span class="comment"> * &#123;<span class="doctag">@link</span> ApplicationContext&#125;.</span></span><br><span class="line"><span class="comment"> * <span class="doctag">@param</span> args the application arguments (usually passed from a Java main method)</span></span><br><span class="line"><span class="comment"> * <span class="doctag">@return</span> a running &#123;<span class="doctag">@link</span> ApplicationContext&#125;</span></span><br><span class="line"><span class="comment"> */</span></span><br><span class="line"><span class="function"><span class="keyword">public</span> ConfigurableApplicationContext <span class="title">run</span><span class="params">(String... args)</span> </span>&#123;</span><br><span class="line"><span class="comment">//...</span></span><br><span class="line"><span class="comment">//Spring加载了SpringApplicationRunListeners</span></span><br><span class="line">SpringApplicationRunListeners listeners = getRunListeners(args);</span><br><span class="line"><span class="comment">//回调starting方法</span></span><br><span class="line">listeners.starting();</span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line">ApplicationArguments applicationArguments = <span class="keyword">new</span> DefaultApplicationArguments(</span><br><span class="line">args);</span><br><span class="line"><span class="comment">//prepareEnvironment 会将listeners 传入，并在过程中调用listeners的回调函数</span></span><br><span class="line">ConfigurableEnvironment environment = prepareEnvironment(listeners,</span><br><span class="line">applicationArguments);</span><br><span class="line">configureIgnoreBeanInfo(environment);</span><br><span class="line">Banner printedBanner = printBanner(environment);</span><br><span class="line">context = createApplicationContext();</span><br><span class="line">exceptionReporters = getSpringFactoriesInstances(</span><br><span class="line">SpringBootExceptionReporter.class,</span><br><span class="line"><span class="keyword">new</span> Class[] &#123; ConfigurableApplicationContext.class &#125;, context);</span><br><span class="line"><span class="comment">//prepareContext 会将listeners 传入，并在过程中调用listeners的回调函数</span></span><br><span class="line">prepareContext(context, environment, listeners, applicationArguments,</span><br><span class="line">printedBanner);</span><br><span class="line">refreshContext(context);</span><br><span class="line">afterRefresh(context, applicationArguments);</span><br><span class="line">stopWatch.stop();</span><br><span class="line"><span class="keyword">if</span> (<span class="keyword">this</span>.logStartupInfo) &#123;</span><br><span class="line"><span class="keyword">new</span> StartupInfoLogger(<span class="keyword">this</span>.mainApplicationClass)</span><br><span class="line">.logStarted(getApplicationLog(), stopWatch);</span><br><span class="line">&#125;</span><br><span class="line"><span class="comment">//回调started方法</span></span><br><span class="line">listeners.started(context);</span><br><span class="line">callRunners(context, applicationArguments);</span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">catch</span> (Throwable ex) &#123;</span><br><span class="line"><span class="comment">//异常时执行对应的回调</span></span><br><span class="line">handleRunFailure(context, ex, exceptionReporters, listeners);</span><br><span class="line"><span class="keyword">throw</span> <span class="keyword">new</span> IllegalStateException(ex);</span><br><span class="line">&#125;</span><br><span class="line"></span><br><span class="line"><span class="keyword">try</span> &#123;</span><br><span class="line"><span class="comment">//回调running</span></span><br><span class="line">listeners.running(context);</span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">catch</span> (Throwable ex) &#123;</span><br><span class="line">handleRunFailure(context, ex, exceptionReporters, <span class="keyword">null</span>);</span><br><span class="line"><span class="keyword">throw</span> <span class="keyword">new</span> IllegalStateException(ex);</span><br><span class="line">&#125;</span><br><span class="line"><span class="keyword">return</span> context;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure><p>简单阅读启动代码可知，listener的加载是在Spring读取配置文件之前的，因此Spring在配置文件中配置Listenr的难度很高，没有将这个接口暴露给用户也是正常的。如果我们需要自定义listener，需要研究getRunListeners这个方法</p><h2 id="getRunListeners的实现"><a href="#getRunListeners的实现" class="headerlink" title="getRunListeners的实现"></a>getRunListeners的实现</h2><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br></pre></td><td class="code"><pre><span class="line"><span class="function"><span class="keyword">private</span> SpringApplicationRunListeners <span class="title">getRunListeners</span><span class="params">(String[] args)</span> </span>&#123;</span><br><span class="line">Class&lt;?&gt;[] types = <span class="keyword">new</span> Class&lt;?&gt;[] &#123; SpringApplication.class, String[].class &#125;;</span><br><span class="line"><span class="keyword">return</span> <span class="keyword">new</span> SpringApplicationRunListeners(logger, getSpringFactoriesInstances(</span><br><span class="line">SpringApplicationRunListener.class, types, <span class="keyword">this</span>, args));</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure><p>SpringApplicationRunListeners 是 SpringApplicationRunListener的管理类，负责统一调用多个listener的回调方法。真正生成listener对象的是<code>getSpringFactoriesInstances(SpringApplicationRunListener.class, types, this, args)</code>这段代码。</p><p><code>getSpringFactoriesInstances</code>的相关代码:</p><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">private</span> &lt;T&gt; <span class="function">Collection&lt;T&gt; <span class="title">getSpringFactoriesInstances</span><span class="params">(Class&lt;T&gt; type,</span></span></span><br><span class="line"><span class="function"><span class="params">Class&lt;?&gt;[] parameterTypes, Object... args)</span> </span>&#123;</span><br><span class="line">ClassLoader classLoader = Thread.currentThread().getContextClassLoader();</span><br><span class="line"><span class="comment">// Use names and ensure unique to protect against duplicates</span></span><br><span class="line"><span class="comment">// 找到所有实现了type类的类名</span></span><br><span class="line">Set&lt;String&gt; names = <span class="keyword">new</span> LinkedHashSet&lt;&gt;(</span><br><span class="line">SpringFactoriesLoader.loadFactoryNames(type, classLoader));</span><br><span class="line"><span class="comment">// 将类名对应的类初始化，并且作为list返回</span></span><br><span class="line">List&lt;T&gt; instances = createSpringFactoriesInstances(type, parameterTypes,</span><br><span class="line">classLoader, args, names);</span><br><span class="line">AnnotationAwareOrderComparator.sort(instances);</span><br><span class="line"><span class="keyword">return</span> instances;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure><p><code>SpringFactoriesLoader</code>容易被误解是Spring的某个工厂类的Util方法，实际阅读下来后发现，其实这个方法其实是和工厂方法无关的，<code>loadFactoryNames</code>方法会从<code>META-INF/spring.factories</code>文件中读取配置，并返回所有的对应的接口的实现类。这次我们需要的接口是<code>SpringApplicationRunListener</code>，那我们就需要在文件中写<code>org.springframework.boot.SpringApplicationRunListener=com.mine.SpringApplicationRunListener</code></p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;简而言之，继承&lt;code&gt;org.springframework.boot.SpringApplicationRunListener&lt;/code&gt;，并且让Spring加载进来。&lt;/p&gt;
+&lt;h2 id=&quot;为什么要为SpringBoot的启动过程埋点&quot;&gt;&lt;a href=&quot;#为什
+      
+    
+    </summary>
+    
+      <category term="杂记" scheme="https://billxc.github.io/categories/%E6%9D%82%E8%AE%B0/"/>
+    
+    
+      <category term="spring" scheme="https://billxc.github.io/tags/spring/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>记一次遇到的Spring的坑</title>
+    <link href="https://billxc.github.io/2018/09/15/spring%E6%9D%82%E8%AE%B0/spring%E9%81%87%E5%88%B0%E7%9A%84%E4%B8%80%E6%AC%A1%E5%9D%91/"/>
+    <id>https://billxc.github.io/2018/09/15/spring杂记/spring遇到的一次坑/</id>
+    <published>2018-09-15T14:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>昨天我们使用spring mvc搭建的新系统遇到了一个bug。今天排查到了原因，感觉比较有意思，和大家分享一下。  </p><h3 id="背景"><a href="#背景" class="headerlink" title="背景"></a>背景</h3><p>我们使用SpringMVC的Controller来接收参数，并且使用了注解@RequestAttribute。这个注解有两个作用：</p><ol><li>根据参数从当前请求的HttpRequest的Attribute中获取需要的参数（这个参数是我们之前使用Interceptor注入的）</li><li>这个注解有个required属性，默认为true，这个属性会在传入的Attribute 为null时抛出异常（这个异常我们会包装成参数异常并且向客户端返回对应的错误消息）</li></ol><p>依赖于第二点，我们没有进行空指针检查，只进行了业务维度的逻辑验证。</p><h3 id="发现问题"><a href="#发现问题" class="headerlink" title="发现问题"></a>发现问题</h3><p>在一次联调的时候突然发生了空指针的异常，当时我们需要的参数是一个map&lt;Integer,Integer&gt;，而客户端那边由于c#的一些神奇的优化，map变成了一个list，按照我们之前的预期，这种情况应该会产生异常，并且被我们的异常处理器捕获成参数异常。但实际却是没有在最开始的时候产生异常，而是代码进一步运行到了service，在使用null指针的时候报了NPE的错误。</p><h3 id="排查结果"><a href="#排查结果" class="headerlink" title="排查结果"></a>排查结果</h3><p>经过排查，这个异常是是由两个坑合起来产生的:</p><ul><li><p>坑1：<br>  Spring会convert你的源数据作为@RequestAttribute的最终值，比如你传入了一个string类型的”123”，而你需要的是int，这个值会变成int类型的123，而如果你传入的是一个Collection，而目标是个普通的object，他会把集合的第一个元素返回，然后进一步convert，作为你需要的参数。</p></li><li><p>坑2：<br>  required属性的检查在convert参数之前做的，如果源数据不为null，那么就不会因为参数为null而报对应的错，即使被convert之后的参数是null。</p></li></ul><p>而我们的源数据正是一个list，并且第一个元素为null，导致了convert前不为null，绕过了判空检查，但convert之后为null，导致了程序出现NPE错误。</p><p>因此我们不能依赖于框架@RequestAttribute的判空处理，现在解决方法有几个：<br>1.手动检查是否为空<br>2.自己定义一个annotation，然后继承RequestAttributeMethodArgumentResolver，把annotation换成自己的，然后在这个自定义的方法里，在获得参数后进行判空处理<br>3.使用spring aop在Controller层检查参数是否为空。</p><p>第一种会在代码里产生很多重复的非业务逻辑的空检查，我们把这个作为备选项。<br>第二种侵入性过强，我们先放弃了。<br>最终我们选择了第三种</p><h3 id="结论"><a href="#结论" class="headerlink" title="结论"></a>结论</h3><ol><li>@RequestAttribute的判空处理不可靠，必须再进行一次判空以保证传入的参数正确</li><li>有时不能过分信任框架</li></ol><h3 id="后记"><a href="#后记" class="headerlink" title="后记"></a>后记</h3><p>给spring报了个bug，最后还是被关掉了。地址：<a href="https://jira.spring.io/browse/SPR-16438" target="_blank" rel="noopener">https://jira.spring.io/browse/SPR-16438</a></p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;昨天我们使用spring mvc搭建的新系统遇到了一个bug。今天排查到了原因，感觉比较有意思，和大家分享一下。  &lt;/p&gt;
+&lt;h3 id=&quot;背景&quot;&gt;&lt;a href=&quot;#背景&quot; class=&quot;headerlink&quot; title=&quot;背景&quot;&gt;&lt;/a&gt;背景&lt;/h3&gt;&lt;p&gt;我们使用
+      
+    
+    </summary>
+    
+    
+      <category term="spring" scheme="https://billxc.github.io/tags/spring/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Aria2 源码阅读 - InitiateConnectionCommandFactory</title>
+    <link href="https://billxc.github.io/2018/05/30/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB%E7%AC%94%E8%AE%B0/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB-CommandFactory/"/>
+    <id>https://billxc.github.io/2018/05/30/aria2源码阅读笔记/aria2源码阅读-CommandFactory/</id>
+    <published>2018-05-30T16:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>Aria2中使用了抽象工厂模式，InitiateConnectionCommandFactory是一个生产command的抽象工厂</p><h2 id="公共方法"><a href="#公共方法" class="headerlink" title="公共方法"></a>公共方法</h2><ul><li><p><em><code>createInitiateConnectionCommand(int cuid, Request;star; req, DownloadEngine;star; e) : ;star;Command</code></em></p><p>  根据传入的参数，返回对应的command，当前只支持req.protocol为Http的请求，对应的Command为HttpInitiateConnectionCommand</p></li></ul>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;Aria2中使用了抽象工厂模式，InitiateConnectionCommandFactory是一个生产command的抽象工厂&lt;/p&gt;
+&lt;h2 id=&quot;公共方法&quot;&gt;&lt;a href=&quot;#公共方法&quot; class=&quot;headerlink&quot; title=&quot;公共方法&quot;&gt;&lt;/a&gt;公
+      
+    
+    </summary>
+    
+      <category term="Aria2源码阅读" scheme="https://billxc.github.io/categories/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+    
+      <category term="aria2源码阅读" scheme="https://billxc.github.io/tags/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+      <category term="源码阅读" scheme="https://billxc.github.io/tags/%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Aria2 源码阅读 - DownloadEngine</title>
+    <link href="https://billxc.github.io/2018/05/30/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB%E7%AC%94%E8%AE%B0/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB-DownloadEngine/"/>
+    <id>https://billxc.github.io/2018/05/30/aria2源码阅读笔记/aria2源码阅读-DownloadEngine/</id>
+    <published>2018-05-30T10:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>DownloadEngine 是Aria2中负责执行下载命令的类，它持有SegmentMan的引用，负责Command的执行。</p><h2 id="私有变量"><a href="#私有变量" class="headerlink" title="私有变量"></a>私有变量</h2><ul><li><p><em><code>rsockets : vector&lt;Socket;star;&gt;</code></em></p><p>  读套接字</p></li><li><p><em><code>wsockets : vector&lt;Socket;star;&gt;</code></em></p><p>  写读套接字</p></li></ul><h2 id="私有方法"><a href="#私有方法" class="headerlink" title="私有方法"></a>私有方法</h2><ul><li><p><em><code>waitData() : void</code></em></p><p>  等待rsockets或者wsockets可用</p></li></ul><ul><li><p><em><code>addSocket(vector&lt;Socket;star;&gt;&amp; sockets, ;star;Socket socket) : bool</code></em></p><p>  遍历sockets，如果目标socket已经存在，则返回false，否则push socket，并且返回true</p></li><li><p><em><code>deleteSocket(vector&lt;Socket;star;&gt;&amp; sockets, ;star;Socket socket) : bool</code></em></p><p>  遍历sockets，如果目标socket已经存在，则删除socket返回true，否则返回false</p></li></ul><h2 id="公共变量"><a href="#公共变量" class="headerlink" title="公共变量"></a>公共变量</h2><ul><li><p><em><code>nowait : bool</code></em></p><p>  初始值为false</p></li><li><p><em><code>commands : queue&lt;Command;star;&gt;</code></em></p><p>  等待执行的任务列表</p></li><li><p><em><code>segmentMan : ;star;SegmentMan</code></em></p><p>  分块管理器</p></li><li><p><em><code>diskWriter : ;star;DiskWriter</code></em></p></li></ul><ul><li><em><code>logger : ;star;Logger</code></em></li></ul><ul><li><em><code>option : ;star;Option</code></em></li></ul><h2 id="公共方法"><a href="#公共方法" class="headerlink" title="公共方法"></a>公共方法</h2><ul><li><p><em><code>run() : void</code></em></p><p>  开始下载任务，将任务从commands里面取出，如果执行成功，删除任务。</p><p>  每执行完一条任务，调用waitDate，等待可用的socket，打印下载的速度、连接数等情况，并且把nowait置为false</p><p>  全部command执行完后，会调用segmentMan的removeIfFinished，删除下载的配置文件。</p></li><li><p><em><code>addSocketForReadCheck(Socket;star; socket) : bool</code></em></p><p>  尝试在rsockets中添加socket</p></li><li><p><em><code>deleteSocketForReadCheck(Socket;star; socket) : bool</code></em></p><p>  尝试在rsockets中删除socket</p></li><li><p><em><code>addSocketForWriteCheck(Socket;star; socket) : bool</code></em></p><p>  尝试在wsockets中添加socket</p></li><li><p><em><code>deleteSocketForWriteCheck(Socket;star; socket) : bool</code></em></p><p>  尝试在wsockets中删除socket</p></li></ul>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;DownloadEngine 是Aria2中负责执行下载命令的类，它持有SegmentMan的引用，负责Command的执行。&lt;/p&gt;
+&lt;h2 id=&quot;私有变量&quot;&gt;&lt;a href=&quot;#私有变量&quot; class=&quot;headerlink&quot; title=&quot;私有变量&quot;&gt;&lt;/a&gt;私有变
+      
+    
+    </summary>
+    
+      <category term="Aria2源码阅读" scheme="https://billxc.github.io/categories/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+    
+      <category term="aria2源码阅读" scheme="https://billxc.github.io/tags/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+      <category term="源码阅读" scheme="https://billxc.github.io/tags/%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Aria2 源码阅读 - SegmentMan</title>
+    <link href="https://billxc.github.io/2018/05/23/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB%E7%AC%94%E8%AE%B0/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB-SegmentMan/"/>
+    <id>https://billxc.github.io/2018/05/23/aria2源码阅读笔记/aria2源码阅读-SegmentMan/</id>
+    <published>2018-05-23T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>SegmentMan是负责Aria2中某一次的下载的类（This class holds the download progress of the one download entry.）。职责包括：分割下载块，保存下载配置等。</p><h2 id="变量"><a href="#变量" class="headerlink" title="变量"></a>变量</h2><ul><li><p><em><code>totalSize : long long int</code></em></p><p>  总共需要下载的字节数，如果是分块传输编码<code>Chunked transfer encoding</code>，或者<code>Content-Length</code>不存在，则这个字段为0</p></li><li><p><em><code>isSplittable : bool</code></em></p><p>  表示该下载是否可分，即是否启用多线程下载，当总共需要下载的字节数不可知时，会被DownloadCommand设为0</p></li><li><p><em><code>downloadStarted : bool</code></em></p><p>  是否开始下载,默认是false</p></li><li><p><em><code>segments : vector&lt;Segment&gt;</code></em></p><p>  Segment是一个简单的结构体，表示一个文件下载的分块。<br>  代码如下，它有5个字段：</p><ul><li>sp和ep是文件分块的开始和结束的偏移量。这两个变量会被用于http头中: <code>Range: bytes=sp-ep</code></li><li>ds表示已经下载的字节数量  </li><li>finish表示区块下载是否下载完成</li><li>cuid 表示一个唯一的ID<figure class="highlight c"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">typedef</span> <span class="class"><span class="keyword">struct</span> &#123;</span></span><br><span class="line">    <span class="keyword">int</span> cuid;</span><br><span class="line">    <span class="keyword">long</span> <span class="keyword">long</span> <span class="keyword">int</span> sp;</span><br><span class="line">    <span class="keyword">long</span> <span class="keyword">long</span> <span class="keyword">int</span> ep;</span><br><span class="line">    <span class="keyword">long</span> <span class="keyword">long</span> <span class="keyword">int</span> ds;</span><br><span class="line">    <span class="keyword">bool</span> finish;</span><br><span class="line">&#125; Segment;</span><br></pre></td></tr></table></figure></li></ul></li><li><p><em><code>filename : string</code></em></p><p>  文件名，如果没有成功获得文件名，则为长度为0的string</p></li><li><p><em><code>dir : string</code></em></p><p>  下载目录</p></li><li><p><em><code>ufilename : string</code></em></p><p>  用户指定的文件名</p></li><li><p><em><code>logger : ;star;Logger</code> </em></p><p>  用来打印日志的类</p></li><li><p><em><code>SEGMENT_FILE_EXTENSION : const &quot;.aria2&quot;</code></em></p><p>  分区文件的后缀</p></li></ul><h2 id="私有方法"><a href="#私有方法" class="headerlink" title="私有方法"></a>私有方法</h2><ul><li><p><em><code>read(;star;FILE file) : void</code></em></p><p>  从保存的aria2文件中，并且载入配置</p></li><li><p><em><code>openSegFile(string segFilename, string mode) : ;star;FILE</code></em></p><p>  打开保存的aria2文件</p></li></ul><h2 id="公共方法"><a href="#公共方法" class="headerlink" title="公共方法"></a>公共方法</h2><ul><li><p><em><code>getFilePath() : string</code></em></p><p>  将目录和文件名组合返回文件的路径，如果文件名为空，则返回默认值index.html</p></li><li><p><em><code>getSegmentFilePath() : string</code></em></p><p>  将文件路径和分区文件的后缀组合成新的文件名</p></li><li><p><em><code>unregisterId(int cuid) : void</code></em></p><p>  将segments里所有的cuid匹配的segment的cuid设置为0</p></li><li><p><em><code>getSegment(Segment&amp; segment, int cuid) : bool</code></em></p><p>  返回cuid相匹配的Segment, 并且填充到传入的指针中。</p><p>  如果能找到匹配cuid的segment，返回对应的cuid的。</p><p>  如果为segments为空，则返回一个对应的cuid的0值的segment，并将segment push到segments中。</p><p>  如果没有找到，并且<em><code>isSplittable</code></em>为false，则返回false。</p><p>  如果没有找到，但是存在finish为false，且cuid为0的segment，则设定cuid，并返回。</p><p>  如果没有找到，但是存在finish为false的segment，且segment的未完成的大小大于512K（524288 Byte），则将此segment分裂成为两个，将新的segment push进segments并返回。</p></li></ul><ul><li><p><em><code>updateSegment(const Segment&amp; segment) : void</code></em></p><p>  遍历segments，找出cuid,sp,ep相匹配的值，并进行替换。<br>  从结果上是更新了符合条件的Segment的ds和finsh字段</p></li><li><p><em><code>segmentFileExists() : bool</code></em></p><p>  返回分块文件对应的文件名（*.aria2）是否存在。如果分块不可分，则直接返回false</p></li><li><p><em><code>load() : void</code></em></p><p>  从segments信息文件载入segments，如果分块不可分，则不进行任何操作</p></li><li><p><em><code>save() : void</code></em></p><p>  将segments信息保存入（.aria2）文件如果分块不可分，则不进行任何操作</p></li><li><p><em><code>remove() : void</code></em></p><p>  移出.aria2文件</p></li><li><p><em><code>finished() : bool</code></em></p><p>  返回是否下载完成</p></li><li><p><em><code>removeIfFinished() : void</code></em></p><p>  如果下载完成，则移除.aria2文件</p></li><li><p><em><code>getDownloadedSize() : long long int</code></em></p><p>  返回已经下载的文件大小。<br>  计算方式：遍历segments，将所有的segment的已下载数量相加</p></li></ul>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;SegmentMan是负责Aria2中某一次的下载的类（This class holds the download progress of the one download entry.）。职责包括：分割下载块，保存下载配置等。&lt;/p&gt;
+&lt;h2 id=&quot;变量&quot;&gt;&lt;a hre
+      
+    
+    </summary>
+    
+      <category term="Aria2源码阅读" scheme="https://billxc.github.io/categories/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+    
+      <category term="aria2源码阅读" scheme="https://billxc.github.io/tags/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+      <category term="源码阅读" scheme="https://billxc.github.io/tags/%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Aria2 源码阅读 - Command和AbstractCommand</title>
+    <link href="https://billxc.github.io/2018/05/15/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB%E7%AC%94%E8%AE%B0/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB-Command/"/>
+    <id>https://billxc.github.io/2018/05/15/aria2源码阅读笔记/aria2源码阅读-Command/</id>
+    <published>2018-05-15T14:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>Command是DownloadEngin执行的任务的基类，而AbstractCommand则基于Command添加了更多的功能。除了SleepCommand是直接继承Command的，其他所有的Command都是直接或者间接继承了AbstractCommand。</p><h2 id="Command"><a href="#Command" class="headerlink" title="Command"></a>Command</h2><p>Command的定义十分简单，只有一个protected的cuid字段和对应的get方法，一个构造函数，一个析构函数和一个execute方法<br><figure class="highlight cpp"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br></pre></td><td class="code"><pre><span class="line"><span class="class"><span class="keyword">class</span> <span class="title">Command</span> &#123;</span></span><br><span class="line">    <span class="keyword">protected</span>:</span><br><span class="line">    <span class="keyword">int</span> cuid;</span><br><span class="line">    <span class="keyword">public</span>:</span><br><span class="line">    Command(<span class="keyword">int</span> cuid):cuid(cuid) &#123;&#125;</span><br><span class="line">    <span class="keyword">virtual</span> ~Command() &#123;&#125;</span><br><span class="line">    <span class="function"><span class="keyword">virtual</span> <span class="keyword">bool</span> <span class="title">execute</span><span class="params">()</span> </span>= <span class="number">0</span>;</span><br><span class="line"></span><br><span class="line">    <span class="function"><span class="keyword">int</span> <span class="title">getCuid</span><span class="params">()</span> <span class="keyword">const</span> </span>&#123; <span class="keyword">return</span> cuid; &#125;</span><br><span class="line">&#125;;</span><br></pre></td></tr></table></figure></p><h2 id="AbstractCommand"><a href="#AbstractCommand" class="headerlink" title="AbstractCommand"></a>AbstractCommand</h2><h3 id="公共方法"><a href="#公共方法" class="headerlink" title="公共方法"></a>公共方法</h3><ul><li><p><em><code>AbstractCommand(int cuid, Request;star; req, DownloadEngine;star; e, Socket;star; s= NULL)</code></em></p><p>  构造函数<br>  将变量赋值给类属性<br>  Socket使用了传入的socket新建了Socket的拷贝，并且将socket加入downloadEngine的socket列表中<br>  <code>checkSocketIsReadable</code>和<code>checkSocketIsWritable</code>设置为false<br>  <code>checkPoint</code>设为0</p></li><li><p><em><code>~AbstractCommand()</code></em></p><p>  析构方法<br>  将Socket从DownloadEngine的sockets列表中删除，回收socket内存</p></li><li><p><em><code>execute() : bool</code></em></p></li></ul><h3 id="protected-变量"><a href="#protected-变量" class="headerlink" title="protected 变量"></a>protected 变量</h3><ul><li><p><em><code>req : Request;star;</code></em></p><p>  Request</p></li><li><p><em><code>e : DownloadEngine;star;</code></em></p><p>  DownloadEngine</p></li><li><p><em><code>socket : Socket;star;</code></em></p><p>  Socket</p></li><li><p><em><code>checkSocketIsReadable : bool</code></em></p></li></ul><ul><li><em><code>checkSocketIsWritable : bool</code></em></li></ul><h3 id="protected方法"><a href="#protected方法" class="headerlink" title="protected方法"></a>protected方法</h3><ul><li><p><em><code>virtual prepareForRetry() : bool</code></em></p><p>  使用当前Command的参数(cuid,req,e)，新建一个新的command，加入DownloadEngine的下载列表中</p></li><li><p><em><code>virtual onError(Exception;star; e) : void</code></em></p><p>  Do nothing.</p></li></ul><h3 id="未实现的虚方法"><a href="#未实现的虚方法" class="headerlink" title="未实现的虚方法"></a>未实现的虚方法</h3><ul><li><em><code>executeInternal(Segment segment) : bool</code></em></li></ul><h3 id="私有变量"><a href="#私有变量" class="headerlink" title="私有变量"></a>私有变量</h3><ul><li><p><em><code>checkPoint : struct timeval</code></em></p><p>  检查点，表示时间的变量，过来检查当前是否超过该时间点一定时间</p></li></ul><h3 id="私有方法"><a href="#私有方法" class="headerlink" title="私有方法"></a>私有方法</h3><ul><li><p><em><code>updateCheckPoint() : void</code></em></p><p>  将checkPoint更新为现在的时间</p></li><li><p><em><code>isTimeoutDetected() : bool</code></em></p><p>  检查是否超时，判断条件是，当前是否已经过去检查点五秒以上，<br>  如果检查点为0，默认返回false</p></li></ul>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;Command是DownloadEngin执行的任务的基类，而AbstractCommand则基于Command添加了更多的功能。除了SleepCommand是直接继承Command的，其他所有的Command都是直接或者间接继承了AbstractCommand。&lt;/p&gt;
+
+      
+    
+    </summary>
+    
+      <category term="Aria2源码阅读" scheme="https://billxc.github.io/categories/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+    
+      <category term="aria2源码阅读" scheme="https://billxc.github.io/tags/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+      <category term="源码阅读" scheme="https://billxc.github.io/tags/%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Aria2 源码阅读</title>
+    <link href="https://billxc.github.io/2018/04/22/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB%E7%AC%94%E8%AE%B0/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    <id>https://billxc.github.io/2018/04/22/aria2源码阅读笔记/Aria2源码阅读/</id>
+    <published>2018-04-22T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>Aria2是一个用C++写的开源的流行的跨平台的文件下载工具<a href="https://github.com/aria2/aria2" target="_blank" rel="noopener">https://github.com/aria2/aria2</a>。  </p><p>我之前在写百度网盘客户端的时候遇到了文件下载的问题，缺少解决方案，于是便萌生了学习别的开源下载工具的念头。之前用过Aria2，觉得这个软件很不错，于是就选择了它。</p><p>Aria2主分支上的代码库十分庞大，各个类的数量有几十个之多。我这次先选了Aria初次发布(0.1.0版)的代码进行学习，因为这个时候的代码库还没有现在这么庞大，可以比较简单地了解作者的思路。因此可以先从这里出发，等理解作者的思路之后，再去看最新的代码库，就能够事半功倍了。</p><p>我也会将自己学习的过程中的笔记整理出来，同步到博客上。</p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;Aria2是一个用C++写的开源的流行的跨平台的文件下载工具&lt;a href=&quot;https://github.com/aria2/aria2&quot; target=&quot;_blank&quot; rel=&quot;noopener&quot;&gt;https://github.com/aria2/aria2&lt;/a&gt;。
+      
+    
+    </summary>
+    
+      <category term="Aria2源码阅读" scheme="https://billxc.github.io/categories/Aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+    
+      <category term="aria2源码阅读" scheme="https://billxc.github.io/tags/aria2%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+      <category term="源码阅读" scheme="https://billxc.github.io/tags/%E6%BA%90%E7%A0%81%E9%98%85%E8%AF%BB/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>在spring中定义自己的xsd和对应的解析器</title>
+    <link href="https://billxc.github.io/2018/04/15/spring%E6%9D%82%E8%AE%B0/spring_define_xsd/"/>
+    <id>https://billxc.github.io/2018/04/15/spring杂记/spring_define_xsd/</id>
+    <published>2018-04-15T14:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<h2 id="用途"><a href="#用途" class="headerlink" title="用途"></a>用途</h2><p>可以自定义自己的xml标签和解析器，封装实现类，简化使用者的代码，<del>而且比较Coooooool</del>，</p><h2 id="配置文件"><a href="#配置文件" class="headerlink" title="配置文件"></a>配置文件</h2><p>Spring 会扫描每个包下的<code>META-INF/spring.schemas</code>文件，用户可以在这个文件下定义自己的xsd</p><p>对应方式为：</p><p>xsd的虚拟html地址=xsd的文件地址</p><p>写完schema后需要有对应的handler来处理，handler和schema的定义关系保存在<code>META-INF/spring.handlers</code>中</p><p>对应方式为：</p><p>xsd的虚拟html地址=Handler类名</p><h2 id="JAVA代码"><a href="#JAVA代码" class="headerlink" title="JAVA代码"></a>JAVA代码</h2><p>Handler 需要继承NamespaceHandlerSupport，在init方法中绑定元素名称和对应的Parser.</p><h2 id="例子"><a href="#例子" class="headerlink" title="例子"></a>例子</h2><p>META-INF/spring.schemas:</p><figure class="highlight plain"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">http\://autoconfig.jd.com/schema/autoconfig/autoconfig.xsd=META-INF/autoconfig.xsd</span><br></pre></td></tr></table></figure><p>META-INF/spring.handlers</p><figure class="highlight plain"><table><tr><td class="gutter"><pre><span class="line">1</span><br></pre></td><td class="code"><pre><span class="line">http\://autoconfig.jd.com/schema/autoconfig=com.jd.autoconfig.AutoConfigNamespaceHandler</span><br></pre></td></tr></table></figure><p>AutoConfigNamespaceHandler.java</p><figure class="highlight java"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br><span class="line">17</span><br><span class="line">18</span><br><span class="line">19</span><br><span class="line">20</span><br><span class="line">21</span><br><span class="line">22</span><br><span class="line">23</span><br><span class="line">24</span><br><span class="line">25</span><br><span class="line">26</span><br><span class="line">27</span><br><span class="line">28</span><br><span class="line">29</span><br><span class="line">30</span><br><span class="line">31</span><br><span class="line">32</span><br><span class="line">33</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">package</span> com.jd.autoconfig;</span><br><span class="line"></span><br><span class="line"><span class="keyword">public</span> <span class="class"><span class="keyword">class</span> <span class="title">AutoConfigNamespaceHandler</span> <span class="keyword">extends</span> <span class="title">NamespaceHandlerSupport</span> </span>&#123;</span><br><span class="line">    <span class="meta">@Override</span></span><br><span class="line">    <span class="function"><span class="keyword">public</span> <span class="keyword">void</span> <span class="title">init</span><span class="params">()</span> </span>&#123;</span><br><span class="line">        <span class="keyword">this</span>.registerBeanDefinitionParser(<span class="string">"enable-autoconfig"</span>, <span class="keyword">new</span> SwitchParser());</span><br><span class="line">        <span class="keyword">this</span>.registerBeanDefinitionParser(<span class="string">"ucc-provider"</span>, <span class="keyword">new</span> UccProviderParser());</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="class"><span class="keyword">class</span> <span class="title">SwitchParser</span> <span class="keyword">implements</span> <span class="title">BeanDefinitionParser</span> </span>&#123;</span><br><span class="line">        <span class="meta">@Override</span></span><br><span class="line">        <span class="function"><span class="keyword">public</span> BeanDefinition <span class="title">parse</span><span class="params">(Element element, ParserContext parserContext)</span> </span>&#123;</span><br><span class="line">            RootBeanDefinition beanDefinition = <span class="keyword">new</span> RootBeanDefinition();</span><br><span class="line">            beanDefinition.setBeanClass(AutoConfigManager.class);</span><br><span class="line">            <span class="keyword">return</span> beanDefinition;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">    <span class="keyword">static</span> <span class="class"><span class="keyword">class</span> <span class="title">UccProviderParser</span> <span class="keyword">implements</span> <span class="title">BeanDefinitionParser</span> </span>&#123;</span><br><span class="line">        <span class="meta">@Override</span></span><br><span class="line">        <span class="function"><span class="keyword">public</span> BeanDefinition <span class="title">parse</span><span class="params">(Element element, ParserContext parserContext)</span> </span>&#123;</span><br><span class="line">            String id = element.getAttribute(<span class="string">"id"</span>);</span><br><span class="line">            String path = element.getAttribute(<span class="string">"path"</span>);</span><br><span class="line">            RootBeanDefinition beanDefinition = <span class="keyword">new</span> RootBeanDefinition();</span><br><span class="line">            beanDefinition.setBeanClass(UCCProvider.class);</span><br><span class="line">            beanDefinition.getPropertyValues().add(<span class="string">"path"</span>,path);</span><br><span class="line">            parserContext.getRegistry().registerBeanDefinition(id, beanDefinition);</span><br><span class="line">            <span class="keyword">return</span> beanDefinition;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line"></span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;h2 id=&quot;用途&quot;&gt;&lt;a href=&quot;#用途&quot; class=&quot;headerlink&quot; title=&quot;用途&quot;&gt;&lt;/a&gt;用途&lt;/h2&gt;&lt;p&gt;可以自定义自己的xml标签和解析器，封装实现类，简化使用者的代码，&lt;del&gt;而且比较Coooooool&lt;/del&gt;，&lt;/p&gt;
+&lt;h2 id=
+      
+    
+    </summary>
+    
+    
+      <category term="spring" scheme="https://billxc.github.io/tags/spring/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>多线程文件下载的一种思路</title>
+    <link href="https://billxc.github.io/2018/03/20/MISC/%E5%A4%9A%E7%BA%BF%E7%A8%8B%E6%96%87%E4%BB%B6%E4%B8%8B%E8%BD%BD%E7%9A%84%E4%B8%80%E7%A7%8D%E6%80%9D%E8%B7%AF/"/>
+    <id>https://billxc.github.io/2018/03/20/MISC/多线程文件下载的一种思路/</id>
+    <published>2018-03-20T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>最近在尝试用Go写一个百度网盘的第三方客户端，其中涉及到了网盘文件的下载，虽然用简单粗暴的对接http流和文件流就可以做到下载，但下载速度总是不尽如人意<del>而且听上去也不够高端</del>。但如果要调用aria2等专业下载工具的话又显得太笨重，于是就想着自己实现一份简单的多线程下载的工具。</p><h2 id="基本思路"><a href="#基本思路" class="headerlink" title="基本思路"></a>基本思路</h2><p>文件在下载开始的时候就预先分配好空间。在开始下载的时候给定一个下载线程的数量，每个线程负责一块文件的大小，使用HTTP头中的Range字段请求文件的局部数据，使用随机random access写入文件内容。</p><p>虽然使用了多线程下载，在有N条线程的情况下，理论上下载时间会变为1/N，但不可避免地，会有那么一条或者多条线程的下载速度特别慢，最终导致整体下载时间的延长。</p><p>解决方案也很容易就能想到，在其他的线程下载完成后，去帮助没有下载完成的线程去进行下载。虽然是个很简单的思路，但实现的时候却有很多因素需要考虑。</p><h2 id="实现细节"><a href="#实现细节" class="headerlink" title="实现细节"></a>实现细节</h2><h3 id="如何切分任务"><a href="#如何切分任务" class="headerlink" title="如何切分任务"></a>如何切分任务</h3><p>虽然说着切分下载任务，但文件不像蛋糕，可以切出一块来，因此需要一个切分文件的方案。我的方案是定义一个最小的文件块，我定了1MB，然后计算文件的块的数量，再去将这些个文件块分给各个下载线程</p><h3 id="如何避免多个线程同时写造成的异常"><a href="#如何避免多个线程同时写造成的异常" class="headerlink" title="如何避免多个线程同时写造成的异常"></a>如何避免多个线程同时写造成的异常</h3><p>虽然在我自己的实验中没有发生，但是理论上会出现两个线程同时往文件中写数据，并且产生异常的情况。我想到了两个解决方案：</p><ol><li>为写入文件加一个全局的锁，并且只有一个文件输出流，每当线程想要写文件的时候，就需要去获得文件的锁，然后使用唯一的文件输出流，往文件中写。</li><li>下载线程不负责写文件，文件写由另外一个线程完成，写线程维护一个队列，下载线程获得数据内容后，将数据放进队列中，而写线程从队列中读取数据，写到文件中</li></ol><p>方法1的缺点在于，下载线程在等待锁的过程中什么事情都做不了，在网络速度较快的情况下可能影响下载速度，但胜在简单粗暴。而方法2的缺点也很明显，逻辑复杂，需要维护一个额外的和缓存队列。</p><p>我选择了方法1，毕竟我家的小水管还不会让磁盘速度成为下载的瓶颈。</p><h3 id="如何设计算法，进行线程调度"><a href="#如何设计算法，进行线程调度" class="headerlink" title="如何设计算法，进行线程调度"></a>如何设计算法，进行线程调度</h3><p>这一点是我认为最复杂的一点。首先调度器必须要：</p><ol><li>知道当前文件的下载情况</li><li>知道所有线程的下载状态，HTTP请求的的启止点，当前的工作点</li><li>在得知以上信息后，选取合适的新的下载起止点</li><li>在选定起止点后，通知原有线程，任务内容有了变更</li><li>调度算法应该尽量的复用已有的HTTP连接，而不是优先去新建连接</li></ol><p>第一点其实问题不大，可以通过维护一个全局的数据来实现，用不同的标志位来表示对应的文件块当前的下载情况。在有些调度算法中甚至不需要这个数据</p><p>第2、3、4、5点可以认为是一个完整的解决方案，分开来谈意义不大，有些解决方案并不需要其中一些数据。下面我给出我想到的几种实现方向</p><p>先插入一点，因为下载是时刻在进行的，所以调度算法可能在前一秒算出来的结果后一秒就过时了，因此我使用了一个全局的开关，所有线程都会去检查开关，当线程发现正在进行调度计算的时候，在完成当前文件块的的下载后，停止接收新的下载任务，等调度完成后继续下载。下面的讨论，如无特殊说明，均是在这个前提下的。</p><ul><li><p>方案一</p><p>  第一种方案也是我从最初实现衍生而来的。文件先等分为N份，分配给N个线程，每个线程知道自己的起点和终点，但并不会感知到其他线程的存在。</p><p>  其他线程的在有一个线程完成下载后，线程自己去遍历文件的下载状态，找到最长的一块未被下载的空间，开始进行自己的下一次下载。  </p><p>  那么其他线程怎么知道自己的任务被抢了呢？每次线程拿任务前，都需要去检查要下载的下一个块有没有已经被他人抢先标记为下载中或者已下载，如果是，则认为本次下载完成。进入下载完成的处理逻辑</p></li><li><p>方案二</p><p>  在思考的时候，先抛弃线程复用这个概念。将N个线程，改变为N个下载的资格，并且调度器持有所有线程的引用，知道所有线程当前的状态。</p><p>  当一个线程下载完成后，下载资格就出现了空位，那么调度器只需要找到一个未完成任务最多的线程，对线程进行分裂，分裂成两个单独的线程，将旧有线程的下载等分，新线程使用空缺出来的下载资格。</p><p>  这个方案不需要掌握整体的下载进度，因为在最初，文件已经被分到了所有的线程中，而我们之后的每一次分裂操作，都只是分裂了已有的下载任务，不会造成下载的缺失或重复</p><p>  OK，我们的思路已经有了，我们再思考之前说的，线程真的不可以复用吗？答案当然是可以复用。分裂操作完全可以替换成两个旧有线程的状态变化。</p></li></ul><h2 id="其他的细节"><a href="#其他的细节" class="headerlink" title="其他的细节"></a>其他的细节</h2><ol><li><p>识别不支持部分文件请求的URL，表现为，使用header中的range字段后，服务器返回的HTTP状态码不是206，而是200</p></li><li><p>对于有多次跳转的下载链接，应该先完成链接的挑战，再进行多线程的下载</p></li><li><p>加入任务拆分的阈值，如果当前任务已经小于拆分的阈值，则不进行拆分</p></li><li><p>由于网络原因，其中一个线程可能会下载失败，需要优雅地处理网络异常，并且尽可能继续完成下载工作</p></li></ol><h2 id="存在的继续改善的点"><a href="#存在的继续改善的点" class="headerlink" title="存在的继续改善的点"></a>存在的继续改善的点</h2><ol><li>断点续传<br> 很多现代的下载工具都具有断点续传的功能，但这个工具暂时还不具备</li></ol>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;最近在尝试用Go写一个百度网盘的第三方客户端，其中涉及到了网盘文件的下载，虽然用简单粗暴的对接http流和文件流就可以做到下载，但下载速度总是不尽如人意&lt;del&gt;而且听上去也不够高端&lt;/del&gt;。但如果要调用aria2等专业下载工具的话又显得太笨重，于是就想着自己实现一份简
+      
+    
+    </summary>
+    
+      <category term="杂记" scheme="https://billxc.github.io/categories/%E6%9D%82%E8%AE%B0/"/>
+    
+    
+      <category term="多线程" scheme="https://billxc.github.io/tags/%E5%A4%9A%E7%BA%BF%E7%A8%8B/"/>
+    
+      <category term="Golang" scheme="https://billxc.github.io/tags/Golang/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>Hello Hexo</title>
+    <link href="https://billxc.github.io/2018/03/20/hello-world/"/>
+    <id>https://billxc.github.io/2018/03/20/hello-world/</id>
+    <published>2018-03-20T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<p>跟风用了Hexo搭自己的博客，偶尔在上面做一些笔记。</p><p>以前写的一些笔记也迁移了过来，创建时间一律设成了很早的时间，以示区分。一些老的笔记由于格式问题暂时还没有整理完毕。</p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;p&gt;跟风用了Hexo搭自己的博客，偶尔在上面做一些笔记。&lt;/p&gt;
+&lt;p&gt;以前写的一些笔记也迁移了过来，创建时间一律设成了很早的时间，以示区分。一些老的笔记由于格式问题暂时还没有整理完毕。&lt;/p&gt;
+
+      
+    
+    </summary>
+    
+    
+  </entry>
+  
+  <entry>
+    <title>Hive学习笔记</title>
+    <link href="https://billxc.github.io/1999/03/19/Hive/Hive%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/"/>
+    <id>https://billxc.github.io/1999/03/19/Hive/Hive学习笔记/</id>
+    <published>1999-03-19T15:38:49.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<h2 id="MISC"><a href="#MISC" class="headerlink" title="MISC"></a>MISC</h2><ol><li>Hive不支持插入单条语句，只支持2种批量插入。从文件读取数据，或者从别的表读取数据</li></ol><h2 id="Hive-表的种类"><a href="#Hive-表的种类" class="headerlink" title="Hive 表的种类"></a>Hive 表的种类</h2><ol><li><p>内部表</p> <figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">CREATE</span> <span class="keyword">TABLE</span> workers( <span class="keyword">id</span> <span class="built_in">INT</span>, <span class="keyword">name</span> <span class="keyword">STRING</span>)    </span><br><span class="line"><span class="keyword">ROW</span> <span class="keyword">FORMAT</span> <span class="keyword">DELIMITED</span> <span class="keyword">FIELDS</span> <span class="keyword">TERMINATED</span> <span class="keyword">BY</span> <span class="string">'\054'</span>;</span><br></pre></td></tr></table></figure></li><li><p>分区表</p> <figure class="highlight sql"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br></pre></td><td class="code"><pre><span class="line"><span class="keyword">create</span> <span class="keyword">table</span> partition_employee(<span class="keyword">id</span> <span class="built_in">int</span>, <span class="keyword">name</span> <span class="keyword">string</span>)   </span><br><span class="line">    partitioned <span class="keyword">by</span>(daytime <span class="keyword">string</span>)   </span><br><span class="line">    <span class="keyword">row</span> <span class="keyword">format</span> <span class="keyword">delimited</span> <span class="keyword">fields</span> <span class="keyword">TERMINATED</span> <span class="keyword">BY</span> <span class="string">'\054'</span>;</span><br></pre></td></tr></table></figure><p> 分区表可以用来加速查询，不同分区的数据会存储在hdfs不同的文件夹中<br> 分区支持多级分区</p></li><li><p>桶表</p></li><li><p>外部表</p><p> 数据并非由Hive存储(例如数据存储在Hive上)</p></li></ol><h2 id="Hive表分区"><a href="#Hive表分区" class="headerlink" title="Hive表分区"></a>Hive表分区</h2><ul><li>为什么要分区</li></ul><p>Hive表大多数以文件的形式存储在磁盘上，</p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;h2 id=&quot;MISC&quot;&gt;&lt;a href=&quot;#MISC&quot; class=&quot;headerlink&quot; title=&quot;MISC&quot;&gt;&lt;/a&gt;MISC&lt;/h2&gt;&lt;ol&gt;
+&lt;li&gt;Hive不支持插入单条语句，只支持2种批量插入。从文件读取数据，或者从别的表读取数据&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h
+      
+    
+    </summary>
+    
+      <category term="学习笔记" scheme="https://billxc.github.io/categories/%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/"/>
+    
+    
+  </entry>
+  
+  <entry>
+    <title>ES的聚合</title>
+    <link href="https://billxc.github.io/1996/10/01/ES_learning/aggressions(%E8%81%9A%E5%90%88)/"/>
+    <id>https://billxc.github.io/1996/10/01/ES_learning/aggressions(聚合)/</id>
+    <published>1996-10-01T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<h2 id="scripted-metric-aggregation"><a href="#scripted-metric-aggregation" class="headerlink" title="scripted-metric-aggregation"></a>scripted-metric-aggregation</h2><h3 id="abstract"><a href="#abstract" class="headerlink" title="abstract"></a>abstract</h3><pre><code>可以执行脚本,并且返回结果，可用于复杂查询只有map_script</code></pre><h3 id="允许的返回值"><a href="#允许的返回值" class="headerlink" title="允许的返回值"></a>允许的返回值</h3><pre><code>- primitive types- String- Map (containing only keys and values of the types listed here)- Array (containing elements of only the types listed here)</code></pre><h3 id="DEMO"><a href="#DEMO" class="headerlink" title="DEMO"></a>DEMO</h3><figure class="highlight js"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br><span class="line">12</span><br><span class="line">13</span><br><span class="line">14</span><br><span class="line">15</span><br><span class="line">16</span><br></pre></td><td class="code"><pre><span class="line">POST ledger/_search?size=<span class="number">0</span></span><br><span class="line">&#123;</span><br><span class="line">    <span class="string">"query"</span> : &#123;</span><br><span class="line">        <span class="string">"match_all"</span> : &#123;&#125;</span><br><span class="line">    &#125;,</span><br><span class="line">    <span class="string">"aggs"</span>: &#123;</span><br><span class="line">        <span class="string">"profit"</span>: &#123;</span><br><span class="line">            <span class="string">"scripted_metric"</span>: &#123;</span><br><span class="line">                <span class="string">"init_script"</span> : <span class="string">"params._agg.transactions = []"</span>,</span><br><span class="line">                <span class="string">"map_script"</span> : <span class="string">"params._agg.transactions.add(doc.type.value == 'sale' ? doc.amount.value : -1 * doc.amount.value)"</span>,</span><br><span class="line">                <span class="string">"combine_script"</span> : <span class="string">"double profit = 0; for (t in params._agg.transactions) &#123; profit += t &#125; return profit"</span>,</span><br><span class="line">                <span class="string">"reduce_script"</span> : <span class="string">"double profit = 0; for (a in params._aggs) &#123; profit += a &#125; return profit"</span></span><br><span class="line">            &#125;</span><br><span class="line">        &#125;</span><br><span class="line">    &#125;</span><br><span class="line">&#125;</span><br></pre></td></tr></table></figure><h3 id="docs"><a href="#docs" class="headerlink" title="docs"></a>docs</h3><ul><li><p>init_script</p><p>  <em>在找到文档之前就执行，一般会用来进行值的初始化</em></p><p>  Executed prior to any collection of documents. Allows the aggregation to set up any initial state.</p><p>  In the above example, the init_script creates an array transactions in the _agg object.</p></li><li><p>map_script</p><p>  <em>每次找到拿到一个文档就会执行。这是一个必须的参数。如果没有定义combine_script，则需要吧结果放在_agg这个对象中</em></p><p>  Executed once per document collected. This is the only required script. If no combine_script is specified, the resulting state needs to be stored in an object named _agg.</p><p>  In the above example, the map_script checks the value of the type field. If the value is sale the value of the amount field is added to the transactions array. If the value of the type field is not sale the negated value of the amount field is added to transactions.</p></li><li><p>combine_script</p><p>  <em>在每个分片上执行一次，在分片上完成文档收集后执行。允许聚合巩固每个分片上返回的状态。如果combine_script没有提供，则默认返回聚合对象</em></p><p>  Executed once on each shard after document collection is complete. Allows the aggregation to consolidate the state returned from each shard. If a combine_script is not provided the combine phase will return the aggregation variable.</p><p>  In the above example, the combine_script iterates through all the stored transactions, summing the values in the profit variable and finally returns profit.</p></li><li><p>reduce_script</p><p>  <em>在所有的分片都返回结果后会执行，这个脚本可以访问所有的aggs对象列表。若没有这个脚本，则直接返回_aggs对象</em></p><p>  Executed once on the coordinating node after all shards have returned their results. The script is provided with access to a variable _aggs which is an array of the result of the combine_script on each shard. If a reduce_script is not provided the reduce phase will return the _aggs variable.</p><p>  In the above example, the reduce_script iterates through the profit returned by each shard summing the values before returning the final combined profit which will be returned in the response of the aggregation.</p></li></ul><h2 id="Filter-Aggregationedit"><a href="#Filter-Aggregationedit" class="headerlink" title="Filter Aggregationedit"></a>Filter Aggregationedit</h2><h3 id="abstract-1"><a href="#abstract-1" class="headerlink" title="abstract"></a>abstract</h3><p>Defines a single bucket of all the documents in the current document set context that match a specified filter. Often this will be used to narrow down the current aggregation context to a specific set of documents.</p><p>将搜索结果根据fitler分类</p><p>Example:</p><p>POST /sales/_search?size=0<br>{<br>    “aggs” : {<br>        “t_shirts” : {<br>            “filter” : { “term”: { “type”: “t-shirt” } },<br>            “aggs” : {<br>                “avg_price” : { “avg” : { “field” : “price” } }<br>            }<br>        }<br>    }<br>}<br>COPY AS CURLVIEW IN CONSOLE<br>In the above example, we calculate the average price of all the products that are of type t-shirt.</p><p>Response:</p><p>{<br>    …<br>    “aggregations” : {<br>        “t_shirts” : {<br>            “doc_count” : 3,<br>            “avg_price” : { “value” : 128.33333333333334 }<br>        }<br>    }<br>}</p><h3 id="link"><a href="#link" class="headerlink" title="link"></a>link</h3><p><a href="https://www.elastic.co/guide/en/elasticsearch/reference/6.1/search-aggregations-metrics-scripted-metric-aggregation.html" target="_blank" rel="noopener">https://www.elastic.co/guide/en/elasticsearch/reference/6.1/search-aggregations-metrics-scripted-metric-aggregation.html</a></p>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;h2 id=&quot;scripted-metric-aggregation&quot;&gt;&lt;a href=&quot;#scripted-metric-aggregation&quot; class=&quot;headerlink&quot; title=&quot;scripted-metric-aggregation&quot;&gt;&lt;/a&gt;scrip
+      
+    
+    </summary>
+    
+      <category term="学习笔记" scheme="https://billxc.github.io/categories/%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/"/>
+    
+    
+      <category term="ES" scheme="https://billxc.github.io/tags/ES/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>HQL优化</title>
+    <link href="https://billxc.github.io/1996/10/01/Hive/HQ%E4%BC%98%E5%8C%96/"/>
+    <id>https://billxc.github.io/1996/10/01/Hive/HQ优化/</id>
+    <published>1996-10-01T00:00:00.000Z</published>
+    <updated>2022-09-12T04:18:03.613Z</updated>
+    
+    <content type="html"><![CDATA[<h2 id="根本思想"><a href="#根本思想" class="headerlink" title="根本思想"></a>根本思想</h2><ul><li>尽早过滤数据，减少每个阶段数量</li><li>减少job数量</li><li>解决数据倾斜</li></ul><h2 id="过滤数据"><a href="#过滤数据" class="headerlink" title="过滤数据"></a>过滤数据</h2><h3 id="列裁剪"><a href="#列裁剪" class="headerlink" title="列裁剪"></a>列裁剪</h3><p>只查询必要的列，不被查询的列可以不被访问，提升性能</p><h3 id="分区裁剪"><a href="#分区裁剪" class="headerlink" title="分区裁剪"></a>分区裁剪</h3><p>减少不必要的分区</p><h3 id="利用Hive的优化机制减少job数量"><a href="#利用Hive的优化机制减少job数量" class="headerlink" title="利用Hive的优化机制减少job数量"></a>利用Hive的优化机制减少job数量</h3><p>out join inner join，如果是join的key相同，不论表的数量，都会合并为一个mapReduce任务</p><h3 id="job的输入输出优化"><a href="#job的输入输出优化" class="headerlink" title="job的输入输出优化"></a>job的输入输出优化</h3><p>善用muti-insert, union all，不同表的union all相当于multiple inputs，同一个表的union all，相当map一次输出多条</p><figure class="highlight plain"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br><span class="line">10</span><br><span class="line">11</span><br></pre></td><td class="code"><pre><span class="line">insert overwrite table tmp1</span><br><span class="line">select … from a where 条件1;</span><br><span class="line">insert overwrite table tmp2</span><br><span class="line">select… from a where 条件2；</span><br><span class="line">扫描两次a表</span><br><span class="line">from a</span><br><span class="line">insert overwrite table tmp1</span><br><span class="line">select… where 条件1</span><br><span class="line">insert overwrite table tmp2</span><br><span class="line">select… where 条件2;</span><br><span class="line">只扫描一次a表</span><br></pre></td></tr></table></figure><h2 id="Join优化"><a href="#Join优化" class="headerlink" title="Join优化"></a>Join优化</h2><h3 id="避免笛卡尔积"><a href="#避免笛卡尔积" class="headerlink" title="避免笛卡尔积"></a>避免笛卡尔积</h3><figure class="highlight plain"><table><tr><td class="gutter"><pre><span class="line">1</span><br><span class="line">2</span><br><span class="line">3</span><br><span class="line">4</span><br><span class="line">5</span><br><span class="line">6</span><br><span class="line">7</span><br><span class="line">8</span><br><span class="line">9</span><br></pre></td><td class="code"><pre><span class="line">select …</span><br><span class="line">from woa_all_device_info_his A</span><br><span class="line">left outer join (</span><br><span class="line">select * from woa_all_info_his B</span><br><span class="line">where (B.mobile &lt;&gt; ‘unknown’ or B.imsi &lt;&gt; ‘unknown’)</span><br><span class="line">and B.imei &lt;&gt; ‘unknown’</span><br><span class="line">and B.pt = ‘$data_desc’</span><br><span class="line">) C</span><br><span class="line">on A.app_id = C.app_id and A.imei = C.imei</span><br></pre></td></tr></table></figure><h3 id="数据过滤"><a href="#数据过滤" class="headerlink" title="数据过滤"></a>数据过滤</h3><p>在join前过滤掉不需要的数据</p><h3 id="小表放前大表放后原则"><a href="#小表放前大表放后原则" class="headerlink" title="小表放前大表放后原则"></a>小表放前大表放后原则</h3><p>在编写带有join操作的代码语句时，应该将条目少的表/子查询放在join操作符的左边</p><p>因为在Reduce阶段，位于join操作符左边的表的内容会被加载进内存，载入条目较少的表可以有效减少OOM。所以对于同一个key来说，对应的value值小的放前，大的放后。</p><h3 id="map-join-来避免数据倾斜"><a href="#map-join-来避免数据倾斜" class="headerlink" title="map join 来避免数据倾斜"></a>map join 来避免数据倾斜</h3><p>数据倾斜一般是由于代码中的join或group by或distinct的key分布不均导致的</p><h4 id="Join算法一般有两种"><a href="#Join算法一般有两种" class="headerlink" title="Join算法一般有两种"></a>Join算法一般有两种</h4><pre><code>- (map side join)    replication join：把其中一个表复制到所有节点，这样另一个表在每个节点上面的分片就可以跟这个完整的表join了- (reduce side join) repartition join：把两份数据按照join key进行hash重分布，让每个节点处理hash值相同的join key数据，也就是做局部的join</code></pre><h3 id="合理使用left-semi-join"><a href="#合理使用left-semi-join" class="headerlink" title="合理使用left semi join"></a>合理使用left semi join</h3><p>left semi 是比 In exist 效率高的一种方式</p><h3 id="合理使用动态分区"><a href="#合理使用动态分区" class="headerlink" title="合理使用动态分区"></a>合理使用动态分区</h3>]]></content>
+    
+    <summary type="html">
+    
+      
+      
+        &lt;h2 id=&quot;根本思想&quot;&gt;&lt;a href=&quot;#根本思想&quot; class=&quot;headerlink&quot; title=&quot;根本思想&quot;&gt;&lt;/a&gt;根本思想&lt;/h2&gt;&lt;ul&gt;
+&lt;li&gt;尽早过滤数据，减少每个阶段数量&lt;/li&gt;
+&lt;li&gt;减少job数量&lt;/li&gt;
+&lt;li&gt;解决数据倾斜&lt;/li&gt;
+&lt;/
+      
+    
+    </summary>
+    
+      <category term="学习笔记" scheme="https://billxc.github.io/categories/%E5%AD%A6%E4%B9%A0%E7%AC%94%E8%AE%B0/"/>
+    
+    
+      <category term="Hive" scheme="https://billxc.github.io/tags/Hive/"/>
+    
+      <category term="HQL" scheme="https://billxc.github.io/tags/HQL/"/>
+    
+  </entry>
+  
+</feed>
